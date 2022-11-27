@@ -54,6 +54,14 @@ pub enum TryInstantiate {
 	Skip,
 }
 
+/// The reason why a contract is instrumented.
+enum InstrumentReason {
+	/// A new code is uploaded.
+	New,
+	/// Existing code is re-instrumented.
+	Reinstrument,
+}
+
 struct ContractModule<'a, T: Config> {
 	/// A deserialized module. The module is valid (this is Guaranteed by `new` method).
 	module: elements::Module,
@@ -298,7 +306,7 @@ impl<'a, T: Config> ContractModule<'a, T> {
 	/// `import_fn_banlist`: list of function names that are disallowed to be imported
 	fn scan_imports(
 		&self,
-		import_fn_banlist: &[&[u8]],
+		mut import_fn_banlist: impl Iterator<Item = &'static [u8]>,
 	) -> Result<Option<&MemoryType>, &'static str> {
 		let module = &self.module;
 		let import_entries = module.import_section().map(|is| is.entries()).unwrap_or(&[]);
@@ -315,7 +323,7 @@ impl<'a, T: Config> ContractModule<'a, T> {
 						return Err("module uses chain extensions but chain extensions are disabled")
 					}
 
-					if import_fn_banlist.iter().any(|f| import.field().as_bytes() == *f) {
+					if import_fn_banlist.any(|f| import.field().as_bytes() == f) {
 						return Err("module imports a banned function")
 					}
 				},
@@ -378,6 +386,7 @@ fn instrument<E, T>(
 	schedule: &Schedule<T>,
 	determinism: Determinism,
 	try_instantiate: TryInstantiate,
+	reason: InstrumentReason,
 ) -> Result<(Vec<u8>, (u32, u32)), (DispatchError, &'static str)>
 where
 	E: Environment<()>,
@@ -430,9 +439,18 @@ where
 		}
 
 		// We disallow importing `gas` function here since it is treated as implementation detail.
-		let disallowed_imports = [b"gas".as_ref()];
+		let disallowed_imports =
+			[b"gas".as_ref()].as_ref()
+				.into_iter()
+				// We deprecated the random interface. No new codes are allowed to use it.
+				.chain(if matches!(reason, InstrumentReason::New) {
+					[b"seal_random".as_ref(), b"random".as_ref()].as_ref().into_iter()
+				} else {
+					[].as_ref()
+				});
+
 		let memory_limits =
-			get_memory_limits(contract_module.scan_imports(&disallowed_imports)?, schedule)?;
+			get_memory_limits(contract_module.scan_imports(disallowed_imports)?, schedule)?;
 
 		let code = contract_module
 			.inject_gas_metering(determinism)?
@@ -487,8 +505,13 @@ where
 	T: Config,
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
 {
-	let (code, (initial, maximum)) =
-		instrument::<E, T>(original_code.as_ref(), schedule, determinism, try_instantiate)?;
+	let (code, (initial, maximum)) = instrument::<E, T>(
+		original_code.as_ref(),
+		schedule,
+		determinism,
+		try_instantiate,
+		InstrumentReason::New,
+	)?;
 
 	let original_code_len = original_code.len();
 
@@ -534,12 +557,18 @@ where
 	T: Config,
 	T::AccountId: UncheckedFrom<T::Hash> + AsRef<[u8]>,
 {
-	instrument::<E, T>(original_code, schedule, determinism, TryInstantiate::Skip)
-		.map_err(|(err, msg)| {
-			log::error!(target: "runtime::contracts", "CodeRejected during reinstrument: {}", msg);
-			err
-		})
-		.map(|(code, _)| code)
+	instrument::<E, T>(
+		original_code,
+		schedule,
+		determinism,
+		TryInstantiate::Skip,
+		InstrumentReason::Reinstrument,
+	)
+	.map_err(|(err, msg)| {
+		log::error!(target: "runtime::contracts", "CodeRejected during reinstrument: {}", msg);
+		err
+	})
+	.map(|(code, _)| code)
 }
 
 /// Alternate (possibly unsafe) preparation functions used only for benchmarking.
